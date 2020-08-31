@@ -5,12 +5,12 @@ from unittest import case
 from tasks.ceph_test_case import CephTestCase
 import os
 import re
+from StringIO import StringIO
 
 from tasks.cephfs.fuse_mount import FuseMount
 
 from teuthology.orchestra import run
 from teuthology.orchestra.run import CommandFailedError
-from teuthology.contextutil import safe_while
 
 
 log = logging.getLogger(__name__)
@@ -164,12 +164,14 @@ class CephFSTestCase(CephTestCase):
         # Load an config settings of interest
         for setting in self.LOAD_SETTINGS:
             setattr(self, setting, float(self.fs.mds_asok(
-                ['config', 'get', setting], list(self.mds_cluster.mds_ids)[0]
+                ['config', 'get', setting], self.mds_cluster.mds_ids[0]
             )[setting]))
 
         self.configs_set = set()
 
     def tearDown(self):
+        super(CephFSTestCase, self).tearDown()
+
         self.mds_cluster.clear_firewall()
         for m in self.mounts:
             m.teardown()
@@ -179,8 +181,6 @@ class CephFSTestCase(CephTestCase):
 
         for subsys, key in self.configs_set:
             self.mds_cluster.clear_ceph_conf(subsys, key)
-
-        return super(CephFSTestCase, self).tearDown()
 
     def set_conf(self, subsys, key, value):
         self.configs_set.add((subsys, key))
@@ -253,7 +253,7 @@ class CephFSTestCase(CephTestCase):
                 timeout=30
             )
         except RuntimeError:
-            log.warning("Timeout waiting for daemons {0}, while we have {1}".format(
+            log.warn("Timeout waiting for daemons {0}, while we have {1}".format(
                 daemon_ids, get_daemon_names()
             ))
             raise
@@ -261,25 +261,21 @@ class CephFSTestCase(CephTestCase):
     def delete_mds_coredump(self, daemon_id):
         # delete coredump file, otherwise teuthology.internal.coredump will
         # catch it later and treat it as a failure.
-        core_pattern = self.mds_cluster.mds_daemons[daemon_id].remote.sh(
-            "sudo sysctl -n kernel.core_pattern")
-        core_dir = os.path.dirname(core_pattern.strip())
+        p = self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
+            "sudo", "sysctl", "-n", "kernel.core_pattern"], stdout=StringIO())
+        core_dir = os.path.dirname(p.stdout.getvalue().strip())
         if core_dir:  # Non-default core_pattern with a directory in it
             # We have seen a core_pattern that looks like it's from teuthology's coredump
             # task, so proceed to clear out the core file
-            if core_dir[0] == '|':
-                log.info("Piped core dumps to program {0}, skip cleaning".format(core_dir[1:]))
-                return;
-
             log.info("Clearing core from directory: {0}".format(core_dir))
 
             # Verify that we see the expected single coredump
-            ls_output = self.mds_cluster.mds_daemons[daemon_id].remote.sh([
+            ls_proc = self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
                 "cd", core_dir, run.Raw('&&'),
                 "sudo", "ls", run.Raw('|'), "sudo", "xargs", "file"
-            ])
+            ], stdout=StringIO())
             cores = [l.partition(":")[0]
-                     for l in ls_output.strip().split("\n")
+                     for l in ls_proc.stdout.getvalue().strip().split("\n")
                      if re.match(r'.*ceph-mds.* -i +{0}'.format(daemon_id), l)]
 
             log.info("Enumerated cores: {0}".format(cores))
@@ -297,7 +293,7 @@ class CephFSTestCase(CephTestCase):
         timeout = 30
         pause = 2
         test = sorted(test)
-        for i in range(timeout // pause):
+        for i in range(timeout/pause):
             subtrees = self.fs.mds_asok(["get", "subtrees"], mds_id=status.get_rank(self.fs.id, rank)['name'])
             subtrees = filter(lambda s: s['dir']['path'].startswith('/'), subtrees)
             filtered = sorted([(s['dir']['path'], s['auth_first']) for s in subtrees])
@@ -309,11 +305,3 @@ class CephFSTestCase(CephTestCase):
                 return subtrees
             time.sleep(pause)
         raise RuntimeError("rank {0} failed to reach desired subtree state", rank)
-
-    def _wait_until_scrub_complete(self, path="/", recursive=True):
-        out_json = self.fs.rank_tell(["scrub", "start", path] + ["recursive"] if recursive else [])
-        with safe_while(sleep=10, tries=10) as proceed:
-            while proceed():
-                out_json = self.fs.rank_tell(["scrub", "status"])
-                if out_json['status'] == "no active scrubs running":
-                    break;
